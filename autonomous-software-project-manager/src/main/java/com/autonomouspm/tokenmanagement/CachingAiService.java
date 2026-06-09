@@ -1,9 +1,10 @@
 package com.autonomouspm.tokenmanagement;
 
+import com.autonomouspm.config.LangChain4jConfig.GeminiKeyServices;
 import com.autonomouspm.service.AiService;
+import com.autonomouspm.service.AiService.AiServiceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
@@ -13,6 +14,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -54,19 +56,23 @@ public class CachingAiService implements AiService {
     /** Agent label used when a caller does not supply one. */
     private static final String UNKNOWN_AGENT = "UnknownAgent";
 
-    private final AiService delegate;
+    /** Backoff (seconds) applied BEFORE each retry on the next key: retry1=15s, retry2=30s, retry3=60s, retry4=60s. */
+    private static final int[] BACKOFF_SECONDS = {15, 30, 60, 60};
+
+    /** Ordered per-key LLM services; rotation walks this list in index order (key 0 first). */
+    private final List<AiService> keyServices;
     private final LlmCacheRepository cacheRepository;
     private final TokenBudgetConfig tokenBudgetConfig;
 
     /**
-     * @param delegate          the real LLM-backed {@link AiService} (bean named {@code aiService})
+     * @param geminiKeyServices ordered per-key {@link AiService} pool (one per {@code gemini.api.keys} entry)
      * @param cacheRepository   permanent response cache
      * @param tokenBudgetConfig per-agent output-token budgets
      */
-    public CachingAiService(@Qualifier("aiService") AiService delegate,
+    public CachingAiService(GeminiKeyServices geminiKeyServices,
                             LlmCacheRepository cacheRepository,
                             TokenBudgetConfig tokenBudgetConfig) {
-        this.delegate = delegate;
+        this.keyServices = geminiKeyServices.services();
         this.cacheRepository = cacheRepository;
         this.tokenBudgetConfig = tokenBudgetConfig;
     }
@@ -94,8 +100,9 @@ public class CachingAiService implements AiService {
      * @param systemPrompt the system message
      * @param userPrompt   the user message
      * @param agentName    the calling agent's name (for logging and budget lookup)
-     * @return the cached or freshly generated LLM response
-     * @throws com.autonomouspm.service.AiService.AiServiceException if the delegate call fails
+     * @return the cached or freshly generated LLM response, or {@code null} when every
+     *         configured key is exhausted (429/503) or a non-retryable error occurs —
+     *         so the caller's Null Object fallback engages
      */
     public String chat(String systemPrompt, String userPrompt, String agentName) {
         String agent = (agentName == null || agentName.isBlank()) ? UNKNOWN_AGENT : agentName;
@@ -110,14 +117,104 @@ public class CachingAiService implements AiService {
         log.info("Cache miss for agent: {} — calling LLM", agent);
         log.debug("CachingAiService – output-token budget for {} = {}", agent, tokenBudgetConfig.forAgent(agent));
 
-        // Errors propagate here and are never cached.
-        String response = delegate.chat(systemPrompt, userPrompt);
+        // Call the LLM with key rotation + exponential backoff on 429/503.
+        // Returns null when every key is exhausted, so the agent's Null Object path engages.
+        String response = chatWithRotation(systemPrompt, userPrompt, agent);
 
-        // Never cache empty/blank responses.
+        // Never cache null/empty/blank responses.
         if (response != null && !response.isBlank()) {
             persist(hash, agent, response);
         }
         return response;
+    }
+
+    // -------------------------------------------------------------------------
+    // Key rotation + exponential backoff
+    // -------------------------------------------------------------------------
+
+    /**
+     * Calls the LLM trying each key in order. On a 429/503 failure it waits with
+     * exponential backoff (2s before key 1, 4s before key 2, …) and rotates to the
+     * next key. When all keys are exhausted — or a non-rotatable error occurs — it
+     * returns {@code null} so the caller's Null Object fallback engages.
+     *
+     * @return the LLM response text, or {@code null} if no key could satisfy the call
+     */
+    private String chatWithRotation(String systemPrompt, String userPrompt, String agent) {
+        int keyCount = keyServices.size();
+
+        for (int index = 0; index < keyCount; index++) {
+            try {
+                return keyServices.get(index).chat(systemPrompt, userPrompt);
+
+            } catch (AiServiceException e) {
+                boolean rotatable = isRateLimitedOrUnavailable(e);
+                boolean hasNextKey = index + 1 < keyCount;
+
+                if (!rotatable) {
+                    // Not a 429/503 — rotating to another key will not help. Bail to Null Object.
+                    log.error("CachingAiService – agent {} key index {} failed with non-retryable error: {}",
+                            agent, index, e.getMessage());
+                    return null;
+                }
+
+                if (!hasNextKey) {
+                    log.error("CachingAiService – agent {} key index {} hit 429/503 and all {} key(s) "
+                                    + "are exhausted; returning null to trigger Null Object",
+                            agent, index, keyCount);
+                    return null;
+                }
+
+                int waitSeconds = BACKOFF_SECONDS[Math.min(index, BACKOFF_SECONDS.length - 1)];
+                log.warn("CachingAiService – agent {} key index {} failed with 429/503 ({}); "
+                                + "waiting {}s then trying key index {}",
+                        agent, index, e.getMessage(), waitSeconds, index + 1);
+
+                if (!sleepSeconds(waitSeconds)) {
+                    // Interrupted while backing off — abort to Null Object.
+                    log.error("CachingAiService – agent {} interrupted during backoff; returning null", agent);
+                    return null;
+                }
+            }
+        }
+
+        // keyServices was empty (config guards against this, but stay defensive).
+        log.error("CachingAiService – agent {} had no Gemini keys available; returning null", agent);
+        return null;
+    }
+
+    /**
+     * Returns {@code true} when the failure is a rate-limit (429) or service-unavailable
+     * (503) condition, by scanning the exception message and its full cause chain.
+     */
+    private boolean isRateLimitedOrUnavailable(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            String msg = t.getMessage();
+            if (msg == null) {
+                continue;
+            }
+            String lower = msg.toLowerCase();
+            if (lower.contains("429") || lower.contains("rate limit")
+                    || lower.contains("503") || lower.contains("unavailable")
+                    || lower.contains("high demand")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Sleeps for the given number of seconds. Returns {@code false} if interrupted
+     * (restoring the thread's interrupt flag), {@code true} otherwise.
+     */
+    private boolean sleepSeconds(int seconds) {
+        try {
+            Thread.sleep(seconds * 1000L);
+            return true;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     // -------------------------------------------------------------------------
