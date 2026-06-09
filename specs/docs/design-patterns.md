@@ -2,7 +2,7 @@
 
 This project strictly requires the use of 10 specific design patterns. Do not invent alternative implementations or force these patterns where they do not belong. Apply them exactly as mapped below:
 
-1. **Singleton:** Used for `OpenRouterConnectionManager`. Ensures only one instance manages API keys and connection pooling.
+1. **Singleton:** Used for `GeminiConnectionManager`. Ensures only one instance manages API keys and connection pooling.
 2. **Factory Method:** Used for `AgentFactory`. Instantiates specific agent implementations (Requirement Analyst, Risk Analyst, etc.) based on the pipeline stage.
 3. **Builder:** Used for `ProjectReportBuilder`. Compiles the final output step-by-step as each agent finishes its section.
 4. **Chain of Responsibility:** Defines the core execution pipeline. `RequirementAgent` -> `BusinessAgent` -> `DatabaseAgent`, etc. Each agent processes the context and passes it to the next.

@@ -1,288 +1,200 @@
-
 # Module: Risk Analyst Agent
 
 This is the final agent in the Chain of Responsibility.
 
-Its responsibility is to evaluate all project artifacts produced by previous agents and identify risks that could negatively impact project success.
+Its responsibility is to research real-world risks for the user's 
+original project idea using web search, then summarize findings 
+into structured risk factors.
 
-The Risk Analyst focuses on:
+The Risk Analyst does NOT analyze pipeline artifacts.
+The Risk Analyst does NOT perform cost or budget forecasting.
 
-* Technical Risks
-* Requirement Risks
-* Schedule Risks
-* Resource Risks
+---
 
-The Risk Analyst does NOT perform cost estimation or budget forecasting.
+## 0. Project Context
+
+- Base package: com.autonomouspm
+- Context package: com.autonomouspm.context
+- Agent package: com.autonomouspm.agents.risk
+- Infrastructure package: com.autonomouspm.infrastructure
+- Token management package: com.autonomouspm.tokenmanagement
+- Language: Java 21, Spring Boot 3.5.0, LangChain4j 1.0.0-beta3
+- DTOs: Java Records only — no regular classes for data
+- Logging: SLF4J only — zero System.out.println
+- All LLM calls: CachingAiService only — never AiService directly
+- Token budget: 800 max output tokens
+- JSON parsing: Jackson only
 
 ---
 
 ## 1. Input Specifications
 
-### Data Source
+The Risk Analyst receives ONLY:
+- The original user idea string (e.g. "food delivery app")
+- Extracted from RequirementContext.projectIdea (one field only)
 
-Provided via the CentralOrchestrator (Mediator):
-
-* RequirementContext
-* BusinessContext
-* DatabaseContext
-* GanttContext
-
-### Required Inputs
-
-The Risk Analyst must consume:
-
-* Requirements
-* User Stories
-* Business Goals
-* Database Design
-* Relationships
-* Project Tasks
-* Dependencies
-* Project Phases
-* Timeline Estimates
+Do NOT pass full ProjectState to the LLM.
+Do NOT pass DatabaseContext, GanttContext, or BusinessContext to the LLM.
+InputStripper.toRiskAnalystInput() must be updated to return only 
+the idea string, not the full ProjectState.
 
 ---
 
-## 2. Core Logic
+## 2. Web Search Logic
 
-### Design Patterns
+Inject MarketResearchTool (already exists at com.autonomouspm.service.MarketResearchTool).
+Do NOT create a new tool.
 
-* Adapter Pattern through AiService
-* Mediator Pattern through CentralOrchestrator
-* Observer Pattern through EventLogger
-* Builder Pattern for final report generation
+Run exactly 3 searches using search(String query):
 
-### Agent Role
+Search 1: "{idea} startup risks failures"
+Search 2: "{idea} legal compliance challenges"  
+Search 3: "{idea} technical challenges problems"
 
-The LLM must act as a Senior Software Risk Manager.
+Where {idea} is the original user idea string.
 
-Responsibilities:
-
-* Analyze project artifacts
-* Detect technical risks
-* Detect requirement risks
-* Detect schedule risks
-* Detect resource risks
-* Recommend mitigation strategies
-* Calculate risk severity
+Rules:
+- Run all 3 searches before calling the LLM
+- Combine results into one string, labelled by search type
+- If all 3 return INSUFFICIENT_EVIDENCE sentinel, 
+  skip LLM call and return EmptyRiskContext (Null Object)
+- If only some return INSUFFICIENT_EVIDENCE, proceed 
+  with available results only
 
 ---
 
-## 3. Risk Evaluation Rules
+## 3. LLM Call
 
-### Technical Risks
+After collecting search results, call CachingAiService with:
 
-Evaluate:
+System prompt:
+  "You are a Senior Risk Analyst. Analyze the following real-world 
+   research about {idea} and identify 4-6 concrete risks. 
+   Return strict JSON only — no markdown, no preamble."
 
-* Complex database relationships
-* Excessive table coupling
-* Many-to-many relationships
-* Scalability concerns
-* Integration complexity
+User prompt:
+  Combined search results string
 
-### Requirement Risks
-
-Evaluate:
-
-* Ambiguous requirements
-* Missing requirements
-* Conflicting requirements
-* Excessive assumptions
-
-### Schedule Risks
-
-Evaluate:
-
-* Long dependency chains
-* Critical path bottlenecks
-* Large implementation phases
-* High task complexity
-
-### Resource Risks
-
-Evaluate:
-
-* Excessive workload
-* Specialized skill requirements
-* Single points of failure
-* High implementation complexity
+The LLM must return JSON matching RiskContext structure exactly.
+Token budget: 800 max output tokens.
 
 ---
 
-## 4. Hallucination Prevention Rules
+## 4. Observer Updates via EventLogger:
 
-The Risk Analyst MUST NOT:
-
-* Invent risks unsupported by project artifacts
-* Create generic risks without evidence
-* Generate unsupported conclusions
-
-Every risk must be traceable to:
-
-* RequirementContext
-* BusinessContext
-* DatabaseContext
-* GanttContext
-
-If a risk cannot be justified, it must be excluded.
+- "Researching Market Risks..."
+- "Analyzing Legal Risks..."
+- "Analyzing Technical Risks..."
+- "Calculating Risk Scores..."
+- "Finalizing Risk Report..."
 
 ---
 
-## 5. Risk Scoring Model
-
-Risk Score Formula:
-
-Risk Score = Impact Level × Probability Level
-
-Where:
-
-Impact Level:
-
-* 1 = Negligible
-* 2 = Minor
-* 3 = Moderate
-* 4 = Major
-* 5 = Critical
-
-Probability Level:
-
-* 1 = Rare
-* 2 = Unlikely
-* 3 = Possible
-* 4 = Likely
-* 5 = Very Likely
-
-Maximum Risk Score = 25
-
----
-
-## 6. Overall Risk Classification
-
-Calculate overall project risk:
-
-* 0–20 = LOW
-* 21–40 = MEDIUM
-* 41–60 = HIGH
-* 61+ = CRITICAL
-
-The overall score must be derived from identified risks.
-
-The LLM must not arbitrarily choose a risk level.
-
----
-
-## 7. Output Specifications
-
-The LLM response MUST be parsed into a Java Record named RiskContext.
+## 5. Records to Create in com.autonomouspm.context:
 
 ```java
 public record RiskContext(
     int overallRiskScore,
-    String overallRiskLevel,
+    String overallRiskLevel,    // LOW | MEDIUM | HIGH | CRITICAL
     List<RiskFactor> riskFactors,
     String conclusion
 ) {}
-```
 
-```java
 public record RiskFactor(
-    String category,
+    String category,            // Technical | Legal | Market | Resource
     String description,
-    String evidence,
+    String evidence,            // must come from search results
     String mitigationStrategy,
-    int impactLevel,
-    int probabilityLevel,
-    int riskScore
+    int impactLevel,            // 1-5
+    int probabilityLevel,       // 1-5
+    int riskScore               // impactLevel × probabilityLevel
+) {}
+
+public record RiskAnalysisValidationError(
+    String agentName,
+    String errorCode,
+    String message
 ) {}
 ```
 
-### Evidence Requirement
+### Overall Risk Level:
+Derived from average riskScore of all RiskFactors:
+- 1-8   = LOW
+- 9-14  = MEDIUM
+- 15-19 = HIGH
+- 20-25 = CRITICAL
 
-Every RiskFactor must include evidence.
-
-Example:
-
-```text
-Category:
-Schedule
-
-Evidence:
-Task "Order Processing Module"
-depends on 5 other tasks
-
-Risk:
-Potential delivery delay due to dependency chain
-
-Mitigation:
-Break implementation into smaller milestones
-```
+### Null Object on any failure — never return null:
+EmptyRiskContext:
+- overallRiskScore = 0
+- overallRiskLevel = "UNKNOWN"
+- riskFactors = List.of()
+- conclusion = ""
 
 ---
 
-## 8. Validation Rules
+## 6. Validation Rules
 
-Before returning output:
+Create RiskAnalystValidator.java in com.autonomouspm.agents.risk.
 
-* Every risk must contain evidence
-* Every risk must contain mitigation
-* Every risk score must equal Impact × Probability
-* Every risk must map to at least one project artifact
-* Duplicate risks must be removed
+Validate:
+- At least one RiskFactor exists
+- Every RiskFactor has non-empty evidence
+- Every RiskFactor has non-empty mitigationStrategy
+- Every riskScore equals impactLevel × probabilityLevel
+- No duplicate risk descriptions
+- impactLevel and probabilityLevel are between 1-5
 
-If validation fails:
-
-Return RiskAnalysisValidationError.
-
----
-
-## 9. Observer Updates
-
-Publish state updates:
-
-* "Analyzing Requirements..."
-* "Evaluating Database Risks..."
-* "Evaluating Schedule Risks..."
-* "Calculating Risk Scores..."
-* "Finalizing Risk Report..."
+On failure:
+- Log warnings via SLF4J
+- Return RiskAnalysisValidationError
+- Do NOT throw exceptions
+- Do NOT return null
 
 ---
 
-## 10. Output Flow
+## 7. Output Flow
 
-Risk Analyst
+RiskAnalystAgent
 → RiskContext
 → CentralOrchestrator (Mediator)
 → ProjectReportBuilder (Builder Pattern)
 
 ---
 
-## 11. Final Reporting Trigger
+## 8. InputStripper Update
 
-Upon successful generation of RiskContext:
+Update existing InputStripper.toRiskAnalystInput() in 
+com.autonomouspm.tokenmanagement.InputStripper.
 
-1. Notify CentralOrchestrator.
-2. CentralOrchestrator triggers ProjectReportBuilder.
-3. ProjectReportBuilder compiles:
+Current signature returns full ProjectState — change it to:
 
-   * Requirement Report
-   * Business Analysis
-   * Database Design
-   * Project Plan
-   * Risk Assessment
-4. Generate final Markdown report.
+  public static String toRiskAnalystInput(ProjectState state) {
+      if (state == null || state.getRequirementContext() == null) {
+          return "";
+      }
+      return state.getRequirementContext().projectIdea();
+  }
+
+Only extract the idea string. Nothing else.
 
 ---
 
-## 12. Execution Directives
+## 9. Execution Order — one file at a time, wait for approval each:
 
-When tasked to build this module:
+1. RiskContext.java              (com.autonomouspm.context)
+2. RiskFactor.java               (com.autonomouspm.context)
+3. RiskAnalysisValidationError.java (com.autonomouspm.context)
+4. InputStripper.java update     (update toRiskAnalystInput only)
+5. RiskAnalystValidator.java     (com.autonomouspm.agents.risk)
+6. RiskAnalystAgent.java         (com.autonomouspm.agents.risk)
 
-1. Generate RiskContext first.
-2. Generate RiskFactor.
-3. Generate RiskAnalyst implementing the base Agent interface.
-4. Implement risk scoring validation.
-5. Implement hallucination prevention rules.
-6. Trigger final reporting through Mediator.
-7. Ensure output is fully serializable using Jackson.
-
-
+### Hard Restrictions:
+- Do not add any Maven dependency not in pom.xml
+- Do not create any file not listed above
+- SLF4J only — no System.out.println
+- CachingAiService only for LLM calls
+- MarketResearchTool reused directly — no new search tool
+- Never return null — Null Object always
+- Java Records for all DTOs
+- Exactly 3 Tavily searches — no more, no less

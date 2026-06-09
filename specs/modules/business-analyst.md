@@ -1,228 +1,213 @@
-# Module: Business Analyst Agent
-
-This is the second agent in the Chain of Responsibility.
-
-Its responsibility is to transform business requirements into actionable business insights, user stories, epics, and market-driven recommendations.
-
-Unlike other agents, this agent has access to a Market Research Tool and must incorporate external research into its analysis.
-
----
-
-## 1. Input Specifications
-
-### Data Source
-
-Provided via the CentralOrchestrator (Mediator):
-
-* RequirementContext
-
-### Required Inputs
-
-The Business Analyst must consume:
-
-* Executive Summary
-* User Roles
-* Core Features
-* Constraints
-* Assumptions
-* Non-Functional Requirements
-
----
-
-## 2. Core Logic
-
-### Design Pattern
-
-* Uses Adapter Pattern through AiService.
-* Communicates through CentralOrchestrator (Mediator).
-* Publishes progress updates using EventLogger (Observer).
-
-### Agent Role
-
-The LLM must act as a Senior Business Analyst.
-
-Responsibilities:
-
-* Analyze requirements
-* Identify business goals
-* Generate epics
-* Generate user stories
-* Discover user pain points
-* Analyze competitor weaknesses
-* Recommend high-value features
-* Validate business assumptions
-
----
-
-## 3. Market Research Tool Usage
-
-The Business Analyst has access to a Market Research Tool.
-
-The tool may retrieve:
-
-* Competitor information
-* User reviews
-* Forum discussions
-* Public feedback
-* Industry trends
-
-Examples:
-
-* Reddit discussions
-* App Store reviews
-* Play Store reviews
-* Product review platforms
-* Competitor websites
-
----
-
-## 4. Research Rules
-
-The Business Analyst MUST:
-
-### Evidence First
-
-Recommendations must be supported by either:
-
-* Requirements
-* Research findings
-
-### Competitor Analysis
-
-Identify:
-
-* Common strengths
-* Common weaknesses
-* Missing opportunities
-
-### Pain Point Analysis
-
-Extract:
-
-* Frequently reported complaints
-* User frustrations
-* Operational challenges
-
-### Feature Recommendations
-
-Recommend features only when supported by:
-
-* User requirements
-* Market evidence
-
----
-
-## 5. Hallucination Prevention Rules
-
-The Business Analyst MUST NOT:
-
-* Invent competitors
-* Invent market statistics
-* Invent customer feedback
-* Invent trends
-
-If research data is unavailable:
-
-* State "Insufficient Market Evidence"
-* Continue analysis using requirements only
-
----
-
-## 6. Output Specifications
-
-The LLM response MUST be parsed into a Java Record named BusinessContext.
-
-```java
-public record BusinessContext(
-
-    List<String> businessGoals,
-
-    List<String> epics,
-
-    List<UserStory> userStories,
-
-    List<String> marketPainPoints,
-
-    List<String> competitorInsights,
-
-    List<String> recommendedFeatures,
-
-    List<String> validatedAssumptions,
-
-    String businessSummary
-
-) {}
-```
-
-### UserStory
-
-```java
-public record UserStory(
-    String actor,
-    String action,
-    String benefit
-) {}
-```
-
-Example:
-
-"As a Customer, I want to track my order so that I know when it will arrive."
-
-```java
-new UserStory(
-    "Customer",
-    "Track my order",
-    "Know estimated delivery time"
-);
-```
-
----
-
-## 7. Validation Rules
-
-Before returning output:
-
-* Every User Story must map to at least one requirement.
-* Every Recommended Feature must have business justification.
-* Every Competitor Insight must originate from research.
-* Every Pain Point must originate from research.
-* Duplicate stories must be removed.
-
-If validation fails:
-
-Return BusinessAnalysisValidationError.
-
----
-
-## 8. Observer Updates
-
-Publish state updates:
-
-* "Analyzing Business Requirements..."
-* "Researching Market Trends..."
-* "Analyzing Competitors..."
-* "Generating User Stories..."
-* "Preparing Business Report..."
-
----
-
-## 9. Output Flow
-
-Business Analyst
-→ BusinessContext
-→ CentralOrchestrator (Mediator)
-→ Database Architect Agent
-
----
-
-## 10. Execution Directives
-
-When tasked to build this module:
-
-1. Generate UserStory record first.
-2. Generate BusinessContext record.
-3. Generate BusinessAnalyst class implementing the base Agent interface.
-4. Integrate Market Research Tool.
-5. Implement validation logic.
-6. Ensure output is fully serializable using Jackson.
-7. Ensure unsupported claims are rejected.
+package com.sda.agent.agent;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sda.agent.model.*;
+import com.sda.agent.observer.EventLogger;
+import com.sda.agent.tool.AiService;
+import com.sda.agent.tool.MarketResearchTool;
+import com.sda.agent.validation.BusinessAnalystValidator;
+import org.springframework.stereotype.Component;
+
+/**
+ * Business Analyst Agent — second agent in the pipeline.
+ *
+ * Patterns applied:
+ * - Chain of Responsibility : implements Agent<I,O> interface, receives input, passes output forward
+ * - Adapter                 : uses AiService (not Ollama directly — decoupled via interface)
+ * - Observer                : publishes progress events through EventLogger
+ * - Null Object             : returns BusinessAnalysisValidationError instead of throwing or returning null
+ *
+ * Execution Order (per spec Section 10):
+ * 1. Publish "Analyzing Business Requirements..."
+ * 2. Run market research (use marketResearchTool) check business_research_tool.md
+ * 3. Build LLM prompt with requirements + research
+ * 4. Call LLM via AiService (Adapter)
+ * 5. Parse JSON response into BusinessContext
+ * 6. Validate output
+ * 7. Return BusinessContext or BusinessAnalysisValidationError
+ */
+@Component
+public class BusinessAnalystAgent implements Agent<RequirementContext, Object> {
+
+    private static final String AGENT_NAME = "Business Analyst Agent";
+
+    private final AiService aiService;
+    private final MarketResearchTool marketResearchTool;
+    private final BusinessAnalystValidator validator;
+    private final EventLogger eventLogger;
+    private final ObjectMapper objectMapper;
+
+    public BusinessAnalystAgent(
+        AiService aiService,
+        MarketResearchTool marketResearchTool,
+        BusinessAnalystValidator validator,
+        EventLogger eventLogger,
+        ObjectMapper objectMapper
+    ) {
+        this.aiService          = aiService;
+        this.marketResearchTool = marketResearchTool;
+        this.validator          = validator;
+        this.eventLogger        = eventLogger;
+        this.objectMapper       = objectMapper;
+    }
+
+    @Override
+    public String agentName() {
+        return AGENT_NAME;
+    }
+
+    /**
+     * Main execution method.
+     * Returns BusinessContext on success.
+     * Returns BusinessAnalysisValidationError on validation failure.
+     * Never returns null — Null Object pattern.
+     */
+    @Override
+    public Object execute(RequirementContext input) {
+
+        // Step 1: Signal start
+        eventLogger.publish(AGENT_NAME, "Analyzing Business Requirements...");
+
+        // Step 2: Run market research
+        eventLogger.publish(AGENT_NAME, "Researching Market Trends...");
+        String domain = extractDomain(input);
+        String researchData = marketResearchTool.researchDomain(domain);
+        boolean researchUsed = !researchData.contains("Insufficient Market Evidence");
+
+        // Step 3: Analyze competitors
+        eventLogger.publish(AGENT_NAME, "Analyzing Competitors...");
+
+        // Step 4: Build the LLM prompt
+        String systemPrompt = buildSystemPrompt();
+        String userPrompt   = buildUserPrompt(input, researchData);
+
+        // Step 5: Call LLM via Adapter
+        eventLogger.publish(AGENT_NAME, "Generating User Stories...");
+        String rawResponse = aiService.complete(systemPrompt, userPrompt);
+
+        // Step 6: Parse response
+        eventLogger.publish(AGENT_NAME, "Preparing Business Report...");
+        BusinessContext context = parseResponse(rawResponse);
+
+        // Step 7: Validate
+        BusinessAnalysisValidationError error = validator.validate(context, input, researchUsed);
+
+        if (error != null && error.hasViolations()) {
+            eventLogger.publish(AGENT_NAME, "Validation FAILED: " + error.summary());
+            return error; // Null Object pattern — safe failure, not null
+        }
+
+        eventLogger.publish(AGENT_NAME, "Business Analysis complete. Passing to Database Architect...");
+        return context;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Private Helpers
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * Extract the domain keyword from the executive summary for market research.
+     */
+    private String extractDomain(RequirementContext input) {
+        // Simple extraction — take first 6 words of executive summary
+        String[] words = input.executiveSummary().split("\\s+");
+        int limit = Math.min(words.length, 6);
+        StringBuilder domain = new StringBuilder();
+        for (int i = 0; i < limit; i++) {
+            domain.append(words[i]).append(" ");
+        }
+        return domain.toString().trim();
+    }
+
+    /**
+     * System prompt — defines the LLM's role and strict rules.
+     */
+    private String buildSystemPrompt() {
+        return """
+            You are a Senior Business Analyst with 15 years of experience in software product analysis.
+
+            Your job is to analyze software requirements and produce structured business analysis output.
+
+            STRICT RULES YOU MUST FOLLOW:
+            1. Only recommend features supported by the provided requirements or market research evidence.
+            2. Never invent competitors, statistics, or user feedback. If market data is unavailable, state "Insufficient Market Evidence".
+            3. Every UserStory must map to a real user role from the input.
+            4. Every competitor insight must come from the provided research data — not your training data.
+            5. Remove all duplicate user stories before returning.
+            6. Your output MUST be a valid JSON object matching this exact structure:
+            {
+              "businessGoals": ["string"],
+              "epics": ["string"],
+              "userStories": [{"actor": "string", "action": "string", "benefit": "string"}],
+              "marketPainPoints": ["string"],
+              "competitorInsights": ["string"],
+              "recommendedFeatures": ["string"],
+              "validatedAssumptions": ["string"],
+              "businessSummary": "string"
+            }
+            7. Return ONLY the JSON object. No preamble. No explanation. No markdown.
+            """;
+    }
+
+    /**
+     * User prompt — injects the actual requirements + research data.
+     */
+    private String buildUserPrompt(RequirementContext input, String researchData) {
+        return """
+            Analyze the following software project requirements and market research data.
+            Produce business analysis output in the required JSON format.
+
+            === EXECUTIVE SUMMARY ===
+            %s
+
+            === USER ROLES ===
+            %s
+
+            === CORE FEATURES ===
+            %s
+
+            === CONSTRAINTS ===
+            %s
+
+            === ASSUMPTIONS ===
+            %s
+
+            === NON-FUNCTIONAL REQUIREMENTS ===
+            %s
+
+            === MARKET RESEARCH DATA ===
+            %s
+
+            Produce the JSON output now.
+            """.formatted(
+                input.executiveSummary(),
+                String.join("\n- ", input.userRoles()),
+                String.join("\n- ", input.coreFeatures()),
+                String.join("\n- ", input.constraints()),
+                String.join("\n- ", input.assumptions()),
+                String.join("\n- ", input.nonFunctionalRequirements()),
+                researchData
+            );
+    }
+
+    /**
+     * Parses the LLM's raw JSON response into BusinessContext.
+     * Strips markdown code fences if present (some models add them).
+     */
+    private BusinessContext parseResponse(String rawResponse) {
+        String cleaned = rawResponse.trim();
+
+        // Strip markdown JSON fences if present
+        if (cleaned.startsWith("```")) {
+            cleaned = cleaned.replaceAll("```json\\s*", "").replaceAll("```\\s*", "").trim();
+        }
+
+        try {
+            return objectMapper.readValue(cleaned, BusinessContext.class);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(
+                "BA Agent received invalid JSON from LLM.\nRaw response:\n" + rawResponse, e);
+        }
+    }
+}

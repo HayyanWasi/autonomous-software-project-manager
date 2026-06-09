@@ -11,8 +11,8 @@ Required:
 - lombok
 - jackson-databind
 - langchain4j-core
-- langchain4j-open-ai (used for OpenRouter compatibility)
-- okhttp3 OR spring-webflux (choose one, not both)
+- LLM Provider: Gemini. Use GeminiChatModel
+- Do not use raw HTTP clients for AI orchestration
 
 Optional (only if needed for config):
 - dotenv-java
